@@ -16,8 +16,8 @@ package raft
 
 import (
 	"errors"
-
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"math/rand"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -164,15 +164,87 @@ func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
+	var raft = Raft{
+		id:               c.ID,
+		Term:             0,
+		Vote:             None,
+		RaftLog:          newLog(c.Storage),
+		Prs:              make(map[uint64]*Progress, len(c.peers)),
+		State:            StateFollower,
+		votes:            nil,
+		msgs:             nil,
+		Lead:             0,
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  c.ElectionTick,
+		heartbeatElapsed: 0,
+		electionElapsed:  0,
+		leadTransferee:   0,
+		PendingConfIndex: 0,
+	}
+	for _, i := range c.peers {
+		raft.Prs[i] = &Progress{
+			Match: 0,
+			Next:  0,
+		}
+	}
 	// Your Code Here (2A).
-	return nil
+	return &raft
+}
+
+func (r *Raft) sendSnapshot(to uint64) {
+	snapshot, err := r.RaftLog.storage.Snapshot()
+	if err != nil {
+		return
+	}
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		From:     r.id,
+		To:       to,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	}
+	r.msgs = append(r.msgs, msg)
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
+}
+
+func (l *RaftLog) toSliceIndex(i uint64) int {
+	idx := int(i - l.FirstIndex)
+	if idx < 0 {
+		panic("toSliceIndex: index < 0")
+	}
+	return idx
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	prevIndex := r.Prs[to].Next - 1
+	prevLogTerm, err := r.RaftLog.Term(prevIndex)
+	if err != nil {
+		if err == ErrCompacted {
+			r.sendSnapshot(to)
+			return false
+		}
+		panic(err)
+	}
+	var entries []*pb.Entry
+	n := len(r.RaftLog.entries)
+	for i := r.RaftLog.toSliceIndex(prevIndex + 1); i < n; i++ {
+		entries = append(entries, &r.RaftLog.entries[i])
+	}
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		Commit:  r.RaftLog.committed,
+		LogTerm: prevLogTerm,
+		Index:   prevIndex,
+		Entries: entries,
+	}
+	r.msgs = append(r.msgs, msg)
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -192,6 +264,12 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
+	r.State = StateCandidate
+	r.Lead = None
+	r.Term++
+	r.Vote = r.id
+	r.votes = make(map[uint64]bool)
+	r.votes[r.id] = true
 	// Your Code Here (2A).
 }
 
@@ -199,6 +277,37 @@ func (r *Raft) becomeCandidate() {
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	r.State = StateLeader
+	r.Lead = r.id
+	lastIndex := r.RaftLog.LastIndex()
+	r.heartbeatElapsed = 0
+
+	for peer := range r.Prs {
+		if r.id == peer {
+			r.Prs[peer].Next = lastIndex + 2
+			r.Prs[peer].Match = lastIndex + 1
+		} else {
+			r.Prs[peer].Next = lastIndex + 1
+		}
+	}
+	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
+		EntryType:            0,
+		Term:                 r.Term,
+		Index:                r.RaftLog.LastIndex() + 1,
+		Data:                 nil,
+		XXX_NoUnkeyedLiteral: struct{}{},
+		XXX_unrecognized:     nil,
+		XXX_sizecache:        0,
+	})
+	for i := range r.Prs {
+		if i == r.id {
+			continue
+		}
+		r.sendAppend(i)
+	}
+	if len(r.Prs) == 1 {
+		r.RaftLog.committed = r.Prs[r.id].Match
+	}
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -207,10 +316,29 @@ func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	switch r.State {
 	case StateFollower:
+		r.stepFollower(m)
 	case StateCandidate:
 	case StateLeader:
 	}
 	return nil
+}
+
+func (r *Raft) stepFollower(m pb.Message) {
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		r.doElection()
+	}
+}
+
+func (r *Raft) doElection() {
+	r.becomeCandidate()
+	r.heartbeatElapsed = 0
+	r.electionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+
+	if len(r.Prs) == 1 {
+		r.becomeLeader()
+		return
+	}
 }
 
 // handleAppendEntries handle AppendEntries RPC request
