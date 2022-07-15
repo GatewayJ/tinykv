@@ -1605,7 +1605,7 @@ func newNetworkWithConfig(configFunc func(*Config), peers ...stateMachine) *netw
 func (nw *network) send(msgs ...pb.Message) {
 	for len(msgs) > 0 {
 		m := msgs[0]
-		p := nw.peers[m.To]
+		p := nw.peers[m.To] // 收信人
 		p.Step(m)
 		msgs = append(msgs[1:], nw.filter(p.readMessages())...)
 	}
